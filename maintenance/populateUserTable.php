@@ -18,6 +18,9 @@ ini_set( 'include_path', __DIR__ . '/../../../maintenance' );
 
 require_once 'Maintenance.php';
 
+use MediaWiki\MediaWikiServices;
+use Wikimedia\IPUtils;
+
 class PopulateUserTable extends Maintenance {
 
 	/**
@@ -62,7 +65,7 @@ class PopulateUserTable extends Maintenance {
 				'name' => 'ipb_by_text'
 			],
 			'actor' => [
-				'id' => 'actor_user',
+				'id' => 'actor_id',
 				'name' => 'actor_name'
 			]
 		];
@@ -83,7 +86,7 @@ class PopulateUserTable extends Maintenance {
 
 	public function __construct() {
 		parent::__construct();
-		$this->mDescription = 'Populates the user table creating stub users (user ID and name) from other tables.';
+		$this->addDescription( 'Populates the user table creating stub users (user ID and name) from other tables.' );
 		$this->addOption( 'db', 'Database name, if we don\'t want to write to $wgDBname', false /* required? */, true /* withArg */ );
 		$this->addOption( 'tables', 'Tables to grab users from (pipe separated list) revision, logging, image, oldimage, filearchive, archive, ipblocks, actor', false, true );
 	}
@@ -91,8 +94,9 @@ class PopulateUserTable extends Maintenance {
 	public function execute() {
 		global $wgDBname, $wgActorTableSchemaMigrationStage;
 
-		# Get a single DB_MASTER connection
-		$this->dbw = wfGetDB( DB_MASTER, [], $this->getOption( 'db', $wgDBname ) );
+		# Get a DB connection
+		$dbProvider = MediaWikiServices::getInstance()->getDBLoadBalancerFactory();
+		$this->dbw = $dbProvider->getMainLB()->getConnection( DB_PRIMARY, [], $this->getOption( 'db', $wgDBname ) );
 
 		$useActorTable = false;
 
@@ -132,8 +136,13 @@ class PopulateUserTable extends Maintenance {
 				$this->tables = array_keys( $this->validTables );
 			}
 		}
+
 		foreach ( $this->tables as $table ) {
 			$this->populateUsersFromTable( $table );
+		}
+
+		if ( $useActorTable ) {
+			$this->populateUserIds();
 		}
 	}
 
@@ -187,6 +196,13 @@ class PopulateUserTable extends Maintenance {
 				$lastUserId = $row[$userIDField];
 				$e['user_id'] = $lastUserId;
 				$e['user_name'] = $row[$userNameField];
+
+				# Don't create users for IP addresses
+				if ( IPUtils::isIPAddress( $e['user_name'] ) ) {
+					$row = $result->fetchRow();
+					continue;
+				}
+
 				$inserted = $this->dbw->insert(
 					'user',
 					$e,
@@ -205,6 +221,66 @@ class PopulateUserTable extends Maintenance {
 			}
 		}
 		$this->output( "Done: $count insertions.\n" );
+	}
+
+	function populateUserIds () {
+		$this->output( "Populating user IDs in actor table..." );
+		$count = 0;
+		$lastActorId = 0;
+
+		while ( true ) {
+			# Get all actors without an associated user ID
+			$result = $this->dbw->newSelectQueryBuilder()
+				->select( [ 'actor_id', 'actor_name' ] )
+				->from( 'actor' )
+				->where( [
+					'actor_user IS NULL',
+					"actor_id > $lastActorId"
+				] )
+				->orderBy( 'actor_id' )
+				->limit( $this->mBatchSize )
+				->caller( __METHOD__ )
+				->fetchResultSet();
+
+			if ( !$result->numRows() ) {
+				break;
+			}
+
+			while ( $row = $result->fetchRow() ) {
+				$lastActorId = $row['actor_id'];
+
+				# Try to get a user with the actor's name
+				$userResult = $this->dbw->newSelectQueryBuilder()
+					->select( [ 'user_name', 'user_id' ] )
+					->from( 'user' )
+					->where( [
+						'user_name = ' . $this->dbw->addQuotes( $row['actor_name'] ),
+						'user_password = ' . $this->dbw->addQuotes( '' )
+					] )
+					->caller( __METHOD__ )
+					->fetchResultSet();
+
+				$user = $userResult->fetchRow();
+
+				if ( $user ) {
+					$this->output( "Updating actor {$row['actor_name']} ({$row['actor_id']}) with user ID {$user['user_id']}\n" );
+
+					$this->dbw->update(
+						'actor',
+						[ 'actor_user' => $user['user_id'] ],
+						[ 'actor_id' => $row['actor_id'] ],
+						__METHOD__
+					);
+
+					$count++;
+					if ( $count % 500 == 0 ) {
+						$this->output( "$count actors updated...\n" );
+					}
+				}
+			}
+		}
+
+		$this->output( "Done: $count actors updated.\n" );
 	}
 }
 
